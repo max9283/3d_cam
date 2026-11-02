@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#14161a">
+<title>Скан в 3D</title>
+<style>
+  :root { --bg:#14161a; --card:#1e2127; --fg:#e8eaed; --acc:#4f8cff; --mut:#8a909a; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; -webkit-user-select: none; user-select: none; }
+  html, body { overscroll-behavior: none; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.4 system-ui,sans-serif; max-width:640px; margin:auto;
+         padding: calc(env(safe-area-inset-top, 0px) + 12px) calc(env(safe-area-inset-right, 0px) + 12px) calc(env(safe-area-inset-bottom, 0px) + 16px) calc(env(safe-area-inset-left, 0px) + 12px); }
+  h1 { font-size:20px; margin:4px 0 10px; }
+  details summary { cursor:pointer; font-weight:600; padding:2px 0; }
+  button:active { transform: scale(.97); }
+  .card { background:var(--card); border-radius:12px; padding:10px; margin-bottom:10px; }
+  .view { position:relative; width:100%; aspect-ratio:1; background:#000; border-radius:10px; overflow:hidden; }
+  video, canvas.out { width:100%; height:100%; display:block; object-fit:cover; }
+  .guide { position:absolute; inset:0; pointer-events:none; }
+  .guide:before { content:""; position:absolute; left:50%; top:0; bottom:0; width:1px; background:rgba(255,255,255,.35); }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
+  button { flex:1; min-width:120px; padding:12px; border:0; border-radius:10px; background:var(--acc); color:#fff; font-size:15px; }
+  button.sec { background:#2f343c; }
+  button:disabled { opacity:.4; }
+  label { display:block; font-size:13px; color:var(--mut); margin-top:8px; }
+  input[type=range] { width:100%; }
+  #status { color:var(--mut); font-size:13px; margin-top:6px; min-height:18px; }
+  .thumbs { display:flex; gap:4px; overflow-x:auto; margin-top:8px; }
+  .thumbs canvas { width:48px; height:48px; border-radius:4px; flex:none; background:#000; }
+  ol { margin:4px 0 0 18px; padding:0; color:var(--mut); font-size:13px; }
+</style>
+</head>
+<body>
+<h1>📷 Скан → 3D модель</h1>
+
+<div class="card">
+  <details>
+  <summary>Как сканировать</summary>
+  <ol>
+    <li>Положите предмет на вращающуюся подставку (или на лист бумаги, который можно поворачивать) в центре кадра. Фон — однотонный, свет ровный.</li>
+    <li>Телефон неподвижно (штатив/упор). Нажмите «Снять фон» — когда предмета нет.</li>
+    <li>Поставьте предмет, снимайте кадр, поворачивайте на равный угол (360° / число кадров) и снова снимайте.</li>
+    <li>«Построить модель» → «Сохранить OBJ».</li>
+  </ol>
+  </details>
+</div>
+
+<div class="card">
+  <div class="view">
+    <video id="video" playsinline muted autoplay></video>
+    <div class="guide"></div>
+  </div>
+  <div class="row">
+    <button id="btnCam">Включить камеру</button>
+    <button id="btnBg" class="sec" disabled>Снять фон</button>
+    <button id="btnShot" disabled>Снять кадр (0)</button>
+  </div>
+  <div class="thumbs" id="thumbs"></div>
+  <label>Планируемое число кадров: <b id="nVal">24</b>
+    <input id="nShots" type="range" min="8" max="72" step="4" value="24"></label>
+  <label>Чувствительность к фону (порог): <b id="thVal">35</b>
+    <input id="thr" type="range" min="10" max="120" value="35"></label>
+  <label>Размер предмета в кадре (масштаб): <b id="zVal">1.00</b>
+    <input id="zoom" type="range" min="0.4" max="1.5" step="0.05" value="1"></label>
+  <label>Разрешение сетки: <b id="rVal">64</b>
+    <input id="res" type="range" min="32" max="128" step="16" value="64"></label>
+</div>
+
+<div class="card">
+  <div class="view"><canvas id="out" class="out"></canvas></div>
+  <div class="row">
+    <button id="btnBuild" disabled>Построить модель</button>
+    <button id="btnObj" class="sec" disabled>Сохранить OBJ</button>
+    <button id="btnReset" class="sec">Сброс</button>
+  </div>
+  <div id="status">Включите камеру.</div>
+</div>
+
+<script>
+const S = 256; // размер рабочего кадра
+const $ = id => document.getElementById(id);
+const video = $('video'), out = $('out'), octx = out.getContext('2d');
+let stream = null, bg = null, shots = [];
+let model = null; // {R, vox:Uint8Array}
+let pts = null;   // поверхностные точки для превью
+let yaw = 0.6, pitch = 0.4;
+
+const work = document.createElement('canvas'); work.width = work.height = S;
+const wctx = work.getContext('2d', { willReadFrequently: true });
+
+function status(t){ $('status').textContent = t; }
+for (const [id, lab, f] of [['nShots','nVal',v=>v],['thr','thVal',v=>v],['zoom','zVal',v=>(+v).toFixed(2)],['res','rVal',v=>v]])
+  $(id).addEventListener('input', () => $(lab).textContent = f($(id).value));
+
+$('btnCam').onclick = async () => {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+    video.srcObject = stream;
+    await video.play();
+    $('btnBg').disabled = false;
+    status('Камера включена. Снимите фон (без предмета).');
+  } catch (e) { status('Нет доступа к камере: ' + e.message + ' (нужен HTTPS).'); }
+};
+
+function grab() {
+  const vw = video.videoWidth, vh = video.videoHeight, s = Math.min(vw, vh);
+  wctx.drawImage(video, (vw - s) / 2, (vh - s) / 2, s, s, 0, 0, S, S);
+  return wctx.getImageData(0, 0, S, S);
+}
+
+$('btnBg').onclick = () => {
+  bg = grab();
+  $('btnShot').disabled = false;
+  status('Фон сохранён. Поставьте предмет и снимайте кадры.');
+};
+
+function makeMask(img) {
+  const thr = +$('thr').value, m = new Uint8Array(S * S);
+  for (let i = 0; i < S * S; i++) {
+    const j = i * 4;
+    const d = (Math.abs(img.data[j] - bg.data[j]) + Math.abs(img.data[j+1] - bg.data[j+1]) + Math.abs(img.data[j+2] - bg.data[j+2])) / 3;
+    m[i] = d > thr ? 1 : 0;
+  }
+  return close(m, 2);
+}
+
+// морфологическое закрытие: убирает дырки от шума
+function close(m, r) { return morph(morph(m, r, true), r, false); }
+function morph(m, r, dilate) {
+  const tmp = new Uint8Array(S * S), res = new Uint8Array(S * S);
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    let v = dilate ? 0 : 1;
+    for (let k = -r; k <= r; k++) { const xx = Math.min(S-1, Math.max(0, x + k)); const a = m[y*S+xx]; v = dilate ? (v | a) : (v & a); }
+    tmp[y*S+x] = v;
+  }
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    let v = dilate ? 0 : 1;
+    for (let k = -r; k <= r; k++) { const yy = Math.min(S-1, Math.max(0, y + k)); const a = tmp[yy*S+x]; v = dilate ? (v | a) : (v & a); }
+    res[y*S+x] = v;
+  }
+  return res;
+}
+
+$('btnShot').onclick = () => {
+  if (!bg) return;
+  const img = grab(), mask = makeMask(img);
+  shots.push(mask);
+  const c = document.createElement('canvas'); c.width = c.height = 48;
+  const cx = c.getContext('2d'), id = cx.createImageData(48, 48);
+  for (let y = 0; y < 48; y++) for (let x = 0; x < 48; x++) {
+    const v = mask[Math.floor(y * S / 48) * S + Math.floor(x * S / 48)] ? 255 : 30;
+    const k = (y * 48 + x) * 4; id.data[k] = id.data[k+1] = id.data[k+2] = v; id.data[k+3] = 255;
+  }
+  cx.putImageData(id, 0, 0); $('thumbs').appendChild(c);
+  const n = +$('nShots').value;
+  $('btnShot').textContent = `Снять кадр (${shots.length})`;
+  $('btnBuild').disabled = shots.length < 6;
+  status(`Кадр ${shots.length}. Поверните предмет на ${(360 / n).toFixed(1)}° и снимите следующий.`);
+};
+
+$('btnBuild').onclick = () => {
+  status('Строю модель...');
+  setTimeout(() => { build(); }, 30);
+};
+
+// Вырезание по силуэтам (visual hull), ортографическая проекция, поворотный стол
+function build() {
+  const R = +$('res').value, zoom = +$('zoom').value, n = shots.length;
+  const vox = new Uint8Array(R * R * R).fill(1);
+  for (let s = 0; s < n; s++) {
+    const th = 2 * Math.PI * s / n, c = Math.cos(th), si = Math.sin(th), m = shots[s];
+    for (let i = 0; i < R; i++) {
+      const x = (i + 0.5) / R * 2 - 1;
+      for (let k = 0; k < R; k++) {
+        const z = (k + 0.5) / R * 2 - 1;
+        const xr = x * c + z * si;
+        const u = Math.floor((xr / zoom * 0.5 + 0.5) * S);
+        for (let j = 0; j < R; j++) {
+          const idx = (i * R + j) * R + k;
+          if (!vox[idx]) continue;
+          const y = (j + 0.5) / R * 2 - 1;
+          const v = Math.floor((0.5 - y / zoom * 0.5) * S);
+          if (u < 0 || u >= S || v < 0 || v >= S || !m[v * S + u]) vox[idx] = 0;
+        }
+      }
+    }
+  }
+  model = { R, vox };
+  collectPoints();
+  const cnt = vox.reduce((a, b) => a + b, 0);
+  $('btnObj').disabled = cnt === 0;
+  status(cnt ? `Готово: ${cnt} вокселей, ${pts.length / 3} точек поверхности. Тяните пальцем по превью для вращения.` : 'Модель пуста: уменьшите порог/масштаб или проверьте фон.');
+  render();
+}
+
+const at = (R, v, i, j, k) => (i < 0 || j < 0 || k < 0 || i >= R || j >= R || k >= R) ? 0 : v[(i * R + j) * R + k];
+
+function collectPoints() {
+  const { R, vox } = model, a = [];
+  for (let i = 0; i < R; i++) for (let j = 0; j < R; j++) for (let k = 0; k < R; k++) {
+    if (!vox[(i * R + j) * R + k]) continue;
+    if (!at(R,vox,i+1,j,k) || !at(R,vox,i-1,j,k) || !at(R,vox,i,j+1,k) || !at(R,vox,i,j-1,k) || !at(R,vox,i,j,k+1) || !at(R,vox,i,j,k-1))
+      a.push((i + .5) / R * 2 - 1, (j + .5) / R * 2 - 1, (k + .5) / R * 2 - 1);
+  }
+  pts = new Float32Array(a);
+}
+
+function render() {
+  const W = out.width = out.clientWidth * devicePixelRatio, H = out.height = out.clientHeight * devicePixelRatio;
+  octx.fillStyle = '#0b0c0e'; octx.fillRect(0, 0, W, H);
+  if (!pts) return;
+  const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
+  const n = pts.length / 3, arr = new Array(n);
+  for (let p = 0; p < n; p++) {
+    const x = pts[p*3], y = -pts[p*3+1], z = pts[p*3+2];
+    const x1 = x * cy + z * sy, z1 = -x * sy + z * cy;
+    const y2 = y * cp - z1 * sp, z2 = y * sp + z1 * cp;
+    arr[p] = [x1, y2, z2];
+  }
+  arr.sort((a, b) => b[2] - a[2]);
+  const sc = Math.min(W, H) * 0.4, ps = Math.max(2, sc * 2 / model.R * 1.1);
+  for (const [x, y, z] of arr) {
+    const l = Math.round(90 + 130 * (0.5 - z * 0.5));
+    octx.fillStyle = `rgb(${l},${l+10},${l+30})`;
+    octx.fillRect(W / 2 + x * sc - ps / 2, H / 2 + y * sc - ps / 2, ps, ps);
+  }
+}
+
+let drag = null;
+out.addEventListener('pointerdown', e => { drag = [e.clientX, e.clientY]; out.setPointerCapture(e.pointerId); });
+out.addEventListener('pointerup', () => drag = null);
+out.addEventListener('pointermove', e => {
+  if (!drag) return;
+  yaw += (e.clientX - drag[0]) * 0.01; pitch = Math.max(-1.5, Math.min(1.5, pitch + (e.clientY - drag[1]) * 0.01));
+  drag = [e.clientX, e.clientY]; render();
+});
+window.addEventListener('resize', render);
+
+// В приложении — системное меню «Поделиться/Сохранить», в браузере — обычное скачивание
+async function saveObj(text) {
+  const P = window.Capacitor && window.Capacitor.Plugins;
+  if (P && P.Filesystem && P.Share) {
+    const r = await P.Filesystem.writeFile({ path: 'scan.obj', data: text, directory: 'CACHE', encoding: 'utf8' });
+    await P.Share.share({ title: 'scan.obj', url: r.uri, dialogTitle: 'Сохранить 3D-модель' });
+  } else {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
+    a.download = 'scan.obj'; a.click();
+  }
+}
+
+$('btnObj').onclick = async () => {
+  const { R, vox } = model, verts = [], faces = [], map = new Map();
+  const N = R + 1;
+  const vid = (i, j, k) => {
+    const key = (i * N + j) * N + k;
+    let id = map.get(key);
+    if (!id) { verts.push(`v ${(i / R * 2 - 1).toFixed(4)} ${(j / R * 2 - 1).toFixed(4)} ${(k / R * 2 - 1).toFixed(4)}`); id = verts.length; map.set(key, id); }
+    return id;
+  };
+  const dirs = [
+    [[1,0,0],[[1,0,0],[1,1,0],[1,1,1],[1,0,1]]],
+    [[-1,0,0],[[0,0,0],[0,0,1],[0,1,1],[0,1,0]]],
+    [[0,1,0],[[0,1,0],[0,1,1],[1,1,1],[1,1,0]]],
+    [[0,-1,0],[[0,0,0],[1,0,0],[1,0,1],[0,0,1]]],
+    [[0,0,1],[[0,0,1],[1,0,1],[1,1,1],[0,1,1]]],
+    [[0,0,-1],[[0,0,0],[0,1,0],[1,1,0],[1,0,0]]],
+  ];
+  for (let i = 0; i < R; i++) for (let j = 0; j < R; j++) for (let k = 0; k < R; k++) {
+    if (!vox[(i * R + j) * R + k]) continue;
+    for (const [d, q] of dirs) {
+      if (at(R, vox, i + d[0], j + d[1], k + d[2])) continue;
+      const ids = q.map(o => vid(i + o[0], j + o[1], k + o[2]));
+      faces.push(`f ${ids.join(' ')}`);
+    }
+  }
+  const text = '# scan\n' + verts.join('\n') + '\n' + faces.join('\n') + '\n';
+  try {
+    await saveObj(text);
+    status(`OBJ готов: ${verts.length} вершин, ${faces.length} граней.`);
+  } catch (e) { status('Не удалось сохранить: ' + (e.message || e)); }
+};
+
+$('btnReset').onclick = () => {
+  shots = []; model = null; pts = null; bg = null;
+  $('thumbs').innerHTML = ''; $('btnShot').textContent = 'Снять кадр (0)';
+  $('btnShot').disabled = $('btnBuild').disabled = $('btnObj').disabled = true;
+  render(); status('Сброшено. Снимите фон заново.');
+};
+</script>
+</body>
+</html>
